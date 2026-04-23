@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ULH_DOMAIN="ulh.life"
-ULH_PROJECT_PREFIX="ulh-"
 ULH_CONFIG_DIR="$HOME/.ulh"
 ULH_CONFIG_FILE="$ULH_CONFIG_DIR/config"
 
@@ -31,19 +29,21 @@ load_config() {
 
 require_config() {
   load_config
-  if [[ -z "${CLOUDFLARE_ACCOUNT_ID:-}" || -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${CLOUDFLARE_ZONE_ID:-}" ]]; then
+  if [[ -z "${ULH_DOMAIN:-}" || -z "${ULH_PROJECT_PREFIX:-}" || -z "${CLOUDFLARE_ACCOUNT_ID:-}" || -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${CLOUDFLARE_ZONE_ID:-}" ]]; then
     fatal "Not configured. Run 'ulh setup' first."
   fi
 }
 
 # --- Usage ---
 usage() {
+  load_config
+  local domain="${ULH_DOMAIN:-<your-domain>}"
   cat <<EOF
 ${BOLD}ulh${NC} — Ultra Light Hosting
 
 ${BOLD}Usage:${NC}
-  ulh setup              Configure Cloudflare credentials
-  ulh deploy [folder]    Deploy a project to <name>.${ULH_DOMAIN}
+  ulh setup              Configure domain and Cloudflare credentials
+  ulh deploy [folder]    Deploy a project to <name>.${domain}
   ulh list               List deployed projects
   ulh delete <name>      Delete a deployed project
   ulh help               Show this help
@@ -60,14 +60,20 @@ EOF
 cmd_setup() {
   echo -e "${BOLD}ulh setup${NC}"
   echo ""
+
+  load_config
+
+  echo "Your domain (e.g. ulh.life, demos.example.com):"
+  read -rp "Domain [${ULH_DOMAIN:-}]: " input_domain
+  local domain="${input_domain:-${ULH_DOMAIN:-}}"
+
+  echo ""
   echo "You need three values from the Cloudflare dashboard:"
   echo "  1. Account ID  — Overview page sidebar, or URL: dash.cloudflare.com/<account-id>"
-  echo "  2. Zone ID     — ${ULH_DOMAIN} overview page sidebar"
+  echo "  2. Zone ID     — ${domain:-your domain} overview page sidebar"
   echo "  3. API Token   — My Profile → API Tokens → Create Token"
   echo "                   Needs: Cloudflare Pages:Edit, DNS:Edit, Zone:Read"
   echo ""
-
-  load_config
 
   read -rp "Account ID [${CLOUDFLARE_ACCOUNT_ID:-}]: " input_account_id
   local account_id="${input_account_id:-${CLOUDFLARE_ACCOUNT_ID:-}}"
@@ -78,8 +84,8 @@ cmd_setup() {
   read -rp "API Token [${CLOUDFLARE_API_TOKEN:+****${CLOUDFLARE_API_TOKEN: -4}}]: " input_api_token
   local api_token="${input_api_token:-${CLOUDFLARE_API_TOKEN:-}}"
 
-  if [[ -z "$account_id" || -z "$zone_id" || -z "$api_token" ]]; then
-    fatal "All three values are required."
+  if [[ -z "$domain" || -z "$account_id" || -z "$zone_id" || -z "$api_token" ]]; then
+    fatal "All values are required."
   fi
 
   # Verify the token works
@@ -93,8 +99,14 @@ cmd_setup() {
   fi
   ok "API token is valid"
 
+  # Derive a project prefix from the domain (e.g. ulh.life → ulh-, demos.example.com → demos-)
+  local prefix
+  prefix=$(echo "$domain" | sed 's/\..*//' | tr '[:upper:]' '[:lower:]')
+
   mkdir -p "$ULH_CONFIG_DIR"
   cat > "$ULH_CONFIG_FILE" <<CONF
+ULH_DOMAIN="${domain}"
+ULH_PROJECT_PREFIX="${prefix}-"
 CLOUDFLARE_ACCOUNT_ID="${account_id}"
 CLOUDFLARE_ZONE_ID="${zone_id}"
 CLOUDFLARE_API_TOKEN="${api_token}"
@@ -102,6 +114,10 @@ CONF
   chmod 600 "$ULH_CONFIG_FILE"
 
   ok "Config saved to ${ULH_CONFIG_FILE}"
+  echo ""
+  echo -e "  Domain:  ${BOLD}${domain}${NC}"
+  echo -e "  Prefix:  ${BOLD}${prefix}-${NC}"
+  echo -e "  Deploy:  ${BOLD}<name>.${domain}${NC}"
 }
 
 # --- Detect project type ---
