@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ULH_DOMAIN="ulh.life"
+ULH_PROJECT_PREFIX="ulh-"
+ULH_CONFIG_DIR="$HOME/.ulh"
+ULH_CONFIG_FILE="$ULH_CONFIG_DIR/config"
+
+CF_API_BASE="https://api.cloudflare.com/client/v4"
+
+# --- Colors ---
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()  { echo -e "${CYAN}▸${NC} $1"; }
+ok()    { echo -e "${GREEN}✓${NC} $1"; }
+warn()  { echo -e "${YELLOW}⚠${NC} $1"; }
+err()   { echo -e "${RED}✗${NC} $1" >&2; }
+fatal() { err "$1"; exit 1; }
+
+# --- Config ---
+load_config() {
+  if [[ -f "$ULH_CONFIG_FILE" ]]; then
+    source "$ULH_CONFIG_FILE"
+  fi
+}
+
+require_config() {
+  load_config
+  if [[ -z "${CLOUDFLARE_ACCOUNT_ID:-}" || -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${CLOUDFLARE_ZONE_ID:-}" ]]; then
+    fatal "Not configured. Run 'ulh setup' first."
+  fi
+}
+
+# --- Usage ---
+usage() {
+  cat <<EOF
+${BOLD}ulh${NC} — Ultra Light Hosting
+
+${BOLD}Usage:${NC}
+  ulh setup              Configure Cloudflare credentials
+  ulh deploy [folder]    Deploy a project to <name>.${ULH_DOMAIN}
+  ulh list               List deployed projects
+  ulh delete <name>      Delete a deployed project
+  ulh help               Show this help
+
+${BOLD}Detection:${NC}
+  React (Vite)     →  npm install && npm run build → deploys dist/
+  React (CRA)      →  npm install && npm run build → deploys build/
+  Static HTML      →  deploys folder as-is
+
+EOF
+}
+
+# --- Setup ---
+cmd_setup() {
+  echo -e "${BOLD}ulh setup${NC}"
+  echo ""
+  echo "You need three values from the Cloudflare dashboard:"
+  echo "  1. Account ID  — Overview page sidebar, or URL: dash.cloudflare.com/<account-id>"
+  echo "  2. Zone ID     — ${ULH_DOMAIN} overview page sidebar"
+  echo "  3. API Token   — My Profile → API Tokens → Create Token"
+  echo "                   Needs: Cloudflare Pages:Edit, DNS:Edit, Zone:Read"
+  echo ""
+
+  load_config
+
+  read -rp "Account ID [${CLOUDFLARE_ACCOUNT_ID:-}]: " input_account_id
+  local account_id="${input_account_id:-${CLOUDFLARE_ACCOUNT_ID:-}}"
+
+  read -rp "Zone ID [${CLOUDFLARE_ZONE_ID:-}]: " input_zone_id
+  local zone_id="${input_zone_id:-${CLOUDFLARE_ZONE_ID:-}}"
+
+  read -rp "API Token [${CLOUDFLARE_API_TOKEN:+****${CLOUDFLARE_API_TOKEN: -4}}]: " input_api_token
+  local api_token="${input_api_token:-${CLOUDFLARE_API_TOKEN:-}}"
+
+  if [[ -z "$account_id" || -z "$zone_id" || -z "$api_token" ]]; then
+    fatal "All three values are required."
+  fi
+
+  # Verify the token works
+  info "Verifying API token..."
+  local verify_response
+  verify_response=$(curl -s "${CF_API_BASE}/user/tokens/verify" \
+    -H "Authorization: Bearer ${api_token}")
+
+  if ! echo "$verify_response" | grep -q '"success":true'; then
+    fatal "API token verification failed. Check your token and try again."
+  fi
+  ok "API token is valid"
+
+  mkdir -p "$ULH_CONFIG_DIR"
+  cat > "$ULH_CONFIG_FILE" <<CONF
+CLOUDFLARE_ACCOUNT_ID="${account_id}"
+CLOUDFLARE_ZONE_ID="${zone_id}"
+CLOUDFLARE_API_TOKEN="${api_token}"
+CONF
+  chmod 600 "$ULH_CONFIG_FILE"
+
+  ok "Config saved to ${ULH_CONFIG_FILE}"
+}
+
+# --- Detect project type ---
+# Returns: "vite", "cra", "static"
+detect_project_type() {
+  local dir="$1"
+
+  if [[ -f "$dir/package.json" ]]; then
+    local pkg="$dir/package.json"
+
+    # Check for React dependency
+    if grep -q '"react"' "$pkg" 2>/dev/null; then
+      # Vite: has vite in devDependencies or dependencies
+      if grep -q '"vite"' "$pkg" 2>/dev/null; then
+        echo "vite"
+        return
+      fi
+      # CRA: has react-scripts
+      if grep -q '"react-scripts"' "$pkg" 2>/dev/null; then
+        echo "cra"
+        return
+      fi
+      # Has react but unknown bundler — try vite heuristic
+      if [[ -f "$dir/vite.config.ts" || -f "$dir/vite.config.js" ]]; then
+        echo "vite"
+        return
+      fi
+      # Fallback: treat as generic node build
+      echo "vite"
+      return
+    fi
+  fi
+
+  echo "static"
+}
+
+# --- Get deploy directory based on project type ---
+get_deploy_dir() {
+  local project_type="$1"
+  local base_dir="$2"
+
+  case "$project_type" in
+    vite)   echo "$base_dir/dist" ;;
+    cra)    echo "$base_dir/build" ;;
+    static) echo "$base_dir" ;;
+  esac
+}
+
+# --- Derive project name from directory ---
+derive_project_name() {
+  local dir="$1"
+  # Use git remote name if available, otherwise directory name
+  local name
+  if git -C "$dir" remote get-url origin &>/dev/null; then
+    name=$(git -C "$dir" remote get-url origin | sed 's/.*\///' | sed 's/\.git$//')
+  else
+    name=$(basename "$(cd "$dir" && pwd)")
+  fi
+  # Sanitize: lowercase, replace non-alphanumeric with hyphens, trim hyphens
+  echo "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
+
+# --- Check git status ---
+check_git_clean() {
+  local dir="$1"
+
+  if ! git -C "$dir" rev-parse --is-inside-work-tree &>/dev/null; then
+    warn "Not a git repository. Deploying anyway."
+    return
+  fi
+
+  if [[ -n $(git -C "$dir" status --porcelain) ]]; then
+    warn "You have uncommitted changes:"
+    git -C "$dir" status --short
+    echo ""
+    read -rp "Deploy anyway? [y/N] " answer
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+      fatal "Aborted. Commit your changes first."
+    fi
+  else
+    ok "Working tree is clean"
+  fi
+}
+
+# --- Build if needed ---
+build_project() {
+  local project_type="$1"
+  local dir="$2"
+
+  if [[ "$project_type" == "static" ]]; then
+    return
+  fi
+
+  info "Detected ${BOLD}${project_type}${NC} project — building..."
+
+  if [[ ! -d "$dir/node_modules" ]]; then
+    info "Installing dependencies..."
+    (cd "$dir" && npm install)
+  fi
+
+  info "Running build..."
+  (cd "$dir" && npm run build)
+
+  local deploy_dir
+  deploy_dir=$(get_deploy_dir "$project_type" "$dir")
+
+  if [[ ! -d "$deploy_dir" ]]; then
+    fatal "Build completed but output directory ${deploy_dir} not found"
+  fi
+
+  ok "Build complete → ${deploy_dir}"
+}
+
+# --- Attach custom domain to Pages project ---
+attach_custom_domain() {
+  local name="$1"
+  local cf_project="$2"
+  local subdomain="${name}.${ULH_DOMAIN}"
+
+  info "Attaching custom domain ${BOLD}${subdomain}${NC}..."
+
+  # Check if domain is already attached
+  local existing
+  existing=$(curl -s "${CF_API_BASE}/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${cf_project}/domains" \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+
+  if echo "$existing" | grep -q "\"name\":\"${subdomain}\""; then
+    ok "Custom domain already attached"
+    return
+  fi
+
+  # Attach domain — CF auto-creates the CNAME when zone is on the same account
+  local response
+  response=$(curl -s -X POST "${CF_API_BASE}/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${cf_project}/domains" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+    -d "{\"name\": \"${subdomain}\"}")
+
+  if echo "$response" | grep -q '"success":true'; then
+    ok "Custom domain attached: ${subdomain}"
+  else
+    local error_msg
+    error_msg=$(echo "$response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"//;s/"$//')
+    warn "Could not attach custom domain: ${error_msg:-unknown error}"
+    warn "The .pages.dev URL will still work. You can attach the domain manually later."
+  fi
+}
+
+# --- Remove custom domain from Pages project ---
+remove_custom_domain() {
+  local name="$1"
+  local cf_project="$2"
+  local subdomain="${name}.${ULH_DOMAIN}"
+
+  info "Removing custom domain ${BOLD}${subdomain}${NC}..."
+
+  local response
+  response=$(curl -s -X DELETE "${CF_API_BASE}/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${cf_project}/domains/${subdomain}" \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+
+  if echo "$response" | grep -q '"success":true'; then
+    ok "Custom domain removed"
+  fi
+}
+
+# --- Deploy ---
+cmd_deploy() {
+  require_config
+
+  local dir="${1:-.}"
+  dir=$(cd "$dir" && pwd)
+
+  local name
+  name=$(derive_project_name "$dir")
+  local cf_project="${ULH_PROJECT_PREFIX}${name}"
+
+  echo ""
+  echo -e "${BOLD}Deploying ${CYAN}${name}${NC}${BOLD} → ${CYAN}${name}.${ULH_DOMAIN}${NC}"
+  echo ""
+
+  # Step 1: Check git
+  check_git_clean "$dir"
+
+  # Step 2: Detect & build
+  local project_type
+  project_type=$(detect_project_type "$dir")
+  info "Project type: ${BOLD}${project_type}${NC}"
+
+  build_project "$project_type" "$dir"
+
+  local deploy_dir
+  deploy_dir=$(get_deploy_dir "$project_type" "$dir")
+
+  # Step 3: Ensure CF Pages project exists
+  if ! npx wrangler pages project list 2>/dev/null | grep -q "$cf_project"; then
+    info "Creating Cloudflare Pages project: ${cf_project}"
+    npx wrangler pages project create "$cf_project" --production-branch main 2>/dev/null || true
+  fi
+
+  # Step 4: Deploy
+  info "Deploying to Cloudflare Pages..."
+  local deploy_output
+  deploy_output=$(npx wrangler pages deploy "$deploy_dir" --project-name "$cf_project" --branch main 2>&1)
+  echo "$deploy_output"
+
+  # Step 5: Attach custom domain
+  attach_custom_domain "$name" "$cf_project"
+
+  echo ""
+  ok "Deployed!"
+  echo ""
+  echo -e "  ${BOLD}URL:${NC} https://${name}.${ULH_DOMAIN}"
+  echo -e "  ${BOLD}CF:${NC}  https://${cf_project}.pages.dev"
+  echo ""
+}
+
+# --- List ---
+cmd_list() {
+  require_config
+  info "Fetching deployed projects..."
+  echo ""
+
+  local projects
+  projects=$(curl -s "${CF_API_BASE}/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects" \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+
+  echo "$projects" | grep -o "\"name\":\"${ULH_PROJECT_PREFIX}[^\"]*\"" | sed 's/"name":"//;s/"//' | while read -r cf_project; do
+    local name="${cf_project#"$ULH_PROJECT_PREFIX"}"
+    echo -e "  ${CYAN}${name}${NC} → https://${name}.${ULH_DOMAIN}"
+  done
+}
+
+# --- Delete ---
+cmd_delete() {
+  require_config
+
+  local name="${1:?Usage: ulh delete <name>}"
+  local cf_project="${ULH_PROJECT_PREFIX}${name}"
+
+  warn "This will delete ${BOLD}${cf_project}${NC} and ${name}.${ULH_DOMAIN}"
+  read -rp "Are you sure? [y/N] " answer
+  if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+    fatal "Aborted."
+  fi
+
+  remove_custom_domain "$name" "$cf_project"
+  npx wrangler pages project delete "$cf_project" --yes
+  ok "Deleted ${name}"
+}
+
+# --- Main ---
+case "${1:-help}" in
+  setup)  cmd_setup ;;
+  deploy) shift; cmd_deploy "$@" ;;
+  list)   cmd_list ;;
+  delete) shift; cmd_delete "$@" ;;
+  help|--help|-h) usage ;;
+  *) err "Unknown command: $1"; usage; exit 1 ;;
+esac
