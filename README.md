@@ -2,7 +2,7 @@
 
 Deploy any project to `<name>.<your-domain>` with one command.
 
-Built for POCs. No config files per project, no CI pipelines, no YAML. Just `ulh deploy`.
+Stop hosting POCs on `my-thing.replit.app` or `my-thing.vercel.app`. Put them on your own domain: `my-thing.yourdomain.com`. One command, no config files per project, no CI pipelines, no YAML. Just `ulh deploy`.
 
 ## Install
 
@@ -59,6 +59,17 @@ ulh detects your project type and handles the build automatically:
 | React (Vite) | `package.json` has `react` + `vite` | `npm run build` | `dist/` |
 | React (CRA) | `package.json` has `react-scripts` | `npm run build` | `build/` |
 | Static HTML | Everything else | None | Folder as-is |
+
+If the target folder has no `index.html` but subdirectories do, ulh will error and suggest which one to deploy:
+
+```
+$ ulh deploy ~/projects/my-poc
+✗ No index.html in /Users/you/projects/my-poc
+
+  Found index.html in these subdirectories:
+    ulh deploy /Users/you/projects/my-poc/v1
+    ulh deploy /Users/you/projects/my-poc/v2
+```
 
 ## How it works
 
