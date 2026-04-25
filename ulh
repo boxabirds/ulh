@@ -231,6 +231,32 @@ build_project() {
   ok "Build complete → ${deploy_dir}"
 }
 
+# --- Check deploy directory has an entry point ---
+check_entry_point() {
+  local deploy_dir="$1"
+
+  if [[ ! -f "$deploy_dir/index.html" ]]; then
+    # Look for subdirectories that have an index.html
+    local candidates=()
+    for subdir in "$deploy_dir"/*/; do
+      [[ -f "${subdir}index.html" ]] && candidates+=("$(basename "$subdir")")
+    done
+
+    if [[ ${#candidates[@]} -gt 0 ]]; then
+      err "No index.html in ${deploy_dir}"
+      echo ""
+      echo "  Found index.html in these subdirectories:"
+      for c in "${candidates[@]}"; do
+        echo -e "    ${CYAN}ulh deploy ${deploy_dir}/${c}${NC}"
+      done
+      echo ""
+      return 1
+    else
+      warn "No index.html found in ${deploy_dir} — deploying anyway"
+    fi
+  fi
+}
+
 # --- Attach custom domain to Pages project ---
 attach_custom_domain() {
   local name="$1"
@@ -311,6 +337,9 @@ cmd_deploy() {
   local deploy_dir
   deploy_dir=$(get_deploy_dir "$project_type" "$dir")
 
+  # Step 2b: Verify deploy directory has an entry point
+  check_entry_point "$deploy_dir" || exit 1
+
   # Step 3: Ensure CF Pages project exists
   if ! npx wrangler pages project list 2>/dev/null | grep -q "$cf_project"; then
     info "Creating Cloudflare Pages project: ${cf_project}"
@@ -369,6 +398,11 @@ cmd_delete() {
 }
 
 # --- Main ---
+# Allow sourcing without executing (for tests)
+if [[ "${ULH_SOURCED:-}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 case "${1:-help}" in
   setup)  cmd_setup ;;
   deploy) shift; cmd_deploy "$@" ;;
